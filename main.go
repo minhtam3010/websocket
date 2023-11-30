@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"sync"
@@ -11,141 +11,186 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all connections for testing purposes; replace this with your actual logic
-		return true
-	},
+	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 }
 
-// Client represents a connected WebSocket client.
+// Client struct represents a connected client with its associated roomID.
 type Client struct {
-	IDRoom string
-	UserID int
 	conn   *websocket.Conn
-	send   chan []byte
+	roomID string
+	userID int
 }
 
-var (
-	clients    = make(map[int]*Client)
-	clientsMux sync.Mutex
-)
-
-func newClient(conn *websocket.Conn, idRoom string, userId int) *Client {
-	return &Client{
-		IDRoom: idRoom,
-		UserID: userId,
-		conn:   conn,
-		send:   make(chan []byte),
-	}
-}
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	log.Println("connected to client", clients)
-
-	// Read query
-	idRoom := r.URL.Query().Get("roomId")
-	userIDSTr := r.URL.Query().Get("userId")
-
-	userIDInt, err := strconv.Atoi(userIDSTr)
-	if err != nil {
-		return
-	}
-
-	client := newClient(conn, idRoom, userIDInt)
-	// Register the client
-	clientsMux.Lock()
-	clients[client.UserID] = client
-	clientsMux.Unlock()
-
-	defer func() {
-		// Unregister the client on close
-		clientsMux.Lock()
-		delete(clients, client.UserID)
-		clientsMux.Unlock()
-		client.conn.Close()
-	}()
-
-	// Listen for messages from the client
-	go client.readMessages()
-
-	// Read messages from the client using channel
-
-	// Send messages to the client
-	client.writeMessages()
-}
-
-func (c *Client) readMessages() {
-	for {
-		// // Read message from client
-		// _, msgByte, err := c.conn.ReadMessage()
-		// if err != nil {
-		// 	break
-		// }
-
-		message := Message{}
-		if err := c.conn.ReadJSON(&message); err != nil {
-			log.Println(err)
-			continue
-		}
-
-		broadcastMessage([]byte(message.Content))
-	}
-}
+// Mutex to safely access the clients map.
+var clientsMu sync.Mutex
+var clients = make(map[*websocket.Conn]*Client)
 
 type Message struct {
-	Content string `json:"content"`
+	Content            string `json:"content"`
+	ActionType         string `json:"actionType"`
+	FirstUserID        User   `json:"firstUserId"`
+	SecondUserID       User   `json:"secondUserId"`
+	TimeToSpeak        int    `json:"timeToSpeak"`
+	ChangeRole         bool   `json:"changeRole"`
+	StartGameCountDown int    `json:"startGameCountDown"`
+	IntroduceRole      string `json:"introduceRole"`
 }
 
-func (c *Client) writeMessages() {
+type User struct {
+	ID   int    `json:"id"`
+	Role string `json:"role"`
+}
+
+func handleConnection(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer conn.Close()
+
+	// Assume that the roomID is passed as a query parameter in the URL.
+	roomID := r.URL.Query().Get("roomId")
+	userIDSTr := r.URL.Query().Get("userId")
+
+	var (
+		userID int
+	)
+
+	userID, err = strconv.Atoi(userIDSTr)
+	if err != nil {
+		return
+	}
+
+	client := &Client{
+		conn:   conn,
+		roomID: roomID,
+		userID: userID,
+	}
+
+	// Register the client.
+	clientsMu.Lock()
+	clients[conn] = client
+	clientsMu.Unlock()
+
+	defer func() {
+		// Unregister the client when the connection is closed.
+		clientsMu.Lock()
+		delete(clients, conn)
+		clientsMu.Unlock()
+	}()
+
 	for {
-		select {
-		case _, ok := <-c.send:
-			if !ok {
+		var (
+			message Message
+		)
+		err := conn.ReadJSON(&message)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		switch message.ActionType {
+		case "startGame":
+			respondedMessage := handleStartGame(roomID)
+			// Broadcast the message to all clients in the same room.
+			respondedMessage.StartGameCountDown = 3
+			respondedMessage.ActionType = "startGame"
+			respondedMessage.TimeToSpeak = 10
+			err = broadcastMessage(roomID, respondedMessage)
+			if err != nil {
+				fmt.Println(err)
 				return
 			}
-
-			log.Println("Sending message to client", c.UserID)
-
-			for i := 0; i < 10; i++ {
-				message := Message{Content: fmt.Sprintf("Message %d", i)}
-				err := c.conn.WriteJSON(message)
-				if err != nil {
-					log.Println(err)
-					return
-				}
+		case "countdown":
+			// Broadcast the message to all clients in the same room.
+			err = broadcastMessage(roomID, message)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+		case "changeRole":
+			respondedMessage := handleChangeRole(message)
+			respondedMessage.ChangeRole = true
+			// Broadcast the message to all clients in the same room.
+			err = broadcastMessage(roomID, respondedMessage)
+			if err != nil {
+				fmt.Println(err)
+				return
 			}
 		}
+
 	}
 }
 
-func broadcastMessage(message []byte) {
-	clientsMux.Lock()
-	defer clientsMux.Unlock()
+func handleStartGame(roomID string) Message {
+	var firstRole = ""
+	var (
+		res Message
+	)
+	for _, client := range clients {
+		if client.roomID == roomID {
+			if firstRole != "" && client.userID == res.FirstUserID.ID {
+				continue
+			}
+			if firstRole == "" {
+				whoSpeakFirst := rand.Intn(2)
+				if whoSpeakFirst == 0 {
+					firstRole = "Speaker"
+				} else {
+					firstRole = "Listener"
+				}
+				res.FirstUserID.ID = client.userID
+				res.FirstUserID.Role = firstRole
+			} else {
+				if firstRole == "Speaker" {
+					firstRole = "Listener"
+				} else {
+					firstRole = "Speaker"
+				}
+				res.SecondUserID.ID = client.userID
+				res.SecondUserID.Role = firstRole
+			}
 
-	roomID := string(message)
-	for client := range clients {
-		log.Println("Sending message to client 2", client, clients[client], roomID)
-		log.Println("room Id: ", clients[client].IDRoom)
-		if clients[client].IDRoom == roomID {
-			select {
-			case clients[client].send <- message:
-			default:
-				// If unable to send to a client, assume it's disconnected and remove it
-				close(clients[client].send)
-				delete(clients, client)
+		}
+	}
+	// assgin 2 minutes to speak
+	// res.TimeToSpeak = 120
+	return res
+}
+
+func handleChangeRole(message Message) Message {
+	firstRole := message.FirstUserID.Role
+	message.FirstUserID.Role = message.SecondUserID.Role
+	message.SecondUserID.Role = firstRole
+	message.TimeToSpeak = 10
+	return message
+}
+
+func broadcastMessage(roomID string, message Message) error {
+	// Iterate over all connected clients and send the message to clients in the same room.
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	for _, client := range clients {
+		if client.roomID == roomID {
+			err := client.conn.WriteJSON(message)
+			if err != nil {
+				return err
 			}
 		}
 	}
+	return nil
 }
 
 func main() {
-	http.HandleFunc("/ws", handleWebSocket)
-	log.Fatal(http.ListenAndServe(":8083", nil))
+	http.HandleFunc("/ws", handleConnection)
+
+	fmt.Println("WebSocket server listening on :8083")
+	err := http.ListenAndServe(":8083", nil)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
