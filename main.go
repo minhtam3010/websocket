@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -18,9 +19,10 @@ var upgrader = websocket.Upgrader{
 
 // Client struct represents a connected client with its associated roomID.
 type Client struct {
-	conn   *websocket.Conn
-	roomID string
-	userID int
+	conn                 *websocket.Conn
+	roomID               string
+	userID               int
+	alreadySendCountDown bool
 }
 
 // Mutex to safely access the clients map.
@@ -70,6 +72,7 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 		userID: userID,
 	}
 
+	log.Println("Client connected to room:", userID, roomID)
 	// Register the client.
 	clientsMu.Lock()
 	clients[conn] = client
@@ -96,15 +99,16 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 		case "startGame":
 			respondedMessage := handleStartGame(roomID)
 			// Broadcast the message to all clients in the same room.
-			respondedMessage.StartGameCountDown = 3
+			respondedMessage.StartGameCountDown = 30
 			respondedMessage.ActionType = "startGame"
-			respondedMessage.TimeToSpeak = 10
+			respondedMessage.TimeToSpeak = 600 // 600s = 10 minutes
 			err = broadcastMessage(roomID, respondedMessage)
 			if err != nil {
 				fmt.Println(err)
 				return
 			}
 		case "countdown":
+			log.Println("countdown")
 			// Broadcast the message to all clients in the same room.
 			err = broadcastMessage(roomID, message)
 			if err != nil {
@@ -120,9 +124,38 @@ func handleConnection(w http.ResponseWriter, r *http.Request) {
 				fmt.Println(err)
 				return
 			}
+		default:
+			gameStart := handleStartGameV2(roomID)
+			if gameStart && !client.alreadySendCountDown {
+				log.Println("Game started")
+				client.alreadySendCountDown = true
+				err = broadcastMessage(roomID, Message{
+					ActionType:         "countdown",
+					TimeToSpeak:        600,
+					StartGameCountDown: 30,
+				})
+				if err != nil {
+					fmt.Println(err)
+					return
+				}
+
+			}
+
 		}
 
 	}
+}
+
+func handleStartGameV2(roomID string) bool {
+	count := 0
+	for _, client := range clients {
+		if client.roomID == roomID {
+			count++
+		}
+	}
+
+	log.Println("count", count)
+	return count >= 2
 }
 
 func handleStartGame(roomID string) Message {
@@ -188,8 +221,8 @@ func broadcastMessage(roomID string, message Message) error {
 func main() {
 	http.HandleFunc("/ws", handleConnection)
 
-	fmt.Println("WebSocket server listening on :8083")
-	err := http.ListenAndServe(":8083", nil)
+	fmt.Println("WebSocket server listening on :8082")
+	err := http.ListenAndServe(":8082", nil)
 	if err != nil {
 		fmt.Println(err)
 	}
